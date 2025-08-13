@@ -1,0 +1,344 @@
+<!doctype html>
+
+<html lang="ru">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Змейка-Стрелка</title>
+<link rel="icon" type="image/png" href="зм.png">
+<style>
+  :root{background:#000}
+  html,body{height:100%;margin:0;background:#000;display:flex;align-items:center;justify-content:center}
+  canvas{background:#000;display:block}
+  /* joystick container positioned bottom-left */
+  .joy-wrap{position:fixed;left:20px;bottom:20px;width:140px;height:140px;pointer-events:none}
+  .joy-base{position:absolute;inset:0;border-radius:50%;background:rgba(255,255,255,0.06);box-shadow:inset 0 0 0 2px rgba(255,255,255,0.06);display:flex;align-items:center;justify-content:center}
+  .joy-knob{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);width:56px;height:56px;border-radius:50%;background:rgba(255,255,255,0.14);box-shadow:0 6px 12px rgba(0,0,0,0.6);pointer-events:auto}
+  .score{position:fixed;left:12px;top:12px;color:#fff;font-family:Inter, system-ui, -apple-system, sans-serif;font-weight:600;font-size:20px}
+  .overlay{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;pointer-events:none}
+  .msg{background:rgba(0,0,0,0.6);color:#fff;padding:14px 20px;border-radius:10px;border:2px solid rgba(255,255,255,0.08);pointer-events:auto}
+  button{margin-top:10px;padding:8px 12px;border-radius:8px;border:none;background:#fff;color:#000;cursor:pointer}
+</style>
+</head>
+<body>
+<canvas id="game" width="640" height="640"></canvas>
+<div class="score" id="score">Очки: 0</div>
+<div class="joy-wrap" id="joyWrap">
+  <div class="joy-base"></div>
+  <div class="joy-knob" id="joyKnob"></div>
+</div>
+<div class="overlay" id="overlay"></div><script>
+/* 2D Snake-like game but with an arrow as the "snake" head and a trail (tail). 
+   - White square frame 2px thick inside canvas
+   - Black background
+   - Food: white dots
+   - Score: top-left, +5 per food
+   - Arrow length increases by 2 pixels per food (initial length 5 px)
+   - Control: semi-transparent joystick (touch/mouse), keyboard fallback
+*/
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+// Frame will be a white square centered with 2px border. We'll use padding from canvas edges.
+const padding = 24; // space between canvas edge and white frame
+const frame = { x: padding, y: padding, size: Math.min(W, H) - padding*2 };
+
+let score = 0;
+const scoreEl = document.getElementById('score');
+
+// Movement
+let dir = { x: 1, y: 0 }; // normalized
+let speed = 180; // pixels per second
+
+// Trail (snake body) stored as array of points (x,y)
+let trail = [];
+let desiredLength = 5; // in pixels (initial length)
+
+// Head position
+let head = { x: frame.x + frame.size/2, y: frame.y + frame.size/2 };
+
+// Food
+let food = null;
+const foodRadius = 4; // visual radius
+
+// Game state
+let running = true;
+let lastTime = null;
+let gameOver = false;
+
+// Controls: joystick
+const joyWrap = document.getElementById('joyWrap');
+const joyKnob = document.getElementById('joyKnob');
+let joystickActive = false;
+let joystickCenter = null;
+let joystickRadius = 56; // knob moves within base radius
+
+function placeFood(){
+  const margin = Math.ceil(foodRadius + 8);
+  const minX = frame.x + margin;
+  const maxX = frame.x + frame.size - margin;
+  const minY = frame.y + margin;
+  const maxY = frame.y + frame.size - margin;
+  // place not too close to head
+  for(let i=0;i<200;i++){
+    const x = Math.round(Math.random()*(maxX-minX)+minX);
+    const y = Math.round(Math.random()*(maxY-minY)+minY);
+    // ensure not inside the trail
+    if(!pointOnTrail(x,y,6)){
+      food = {x,y};
+      return;
+    }
+  }
+  // fallback
+  food = { x: (minX+maxX)/2, y: (minY+maxY)/2 };
+}
+
+function pointOnTrail(x,y,minDist){
+  minDist = minDist||4;
+  for(let p of trail){
+    const dx = p.x-x, dy = p.y-y;
+    if(dx*dx+dy*dy <= minDist*minDist) return true;
+  }
+  return false;
+}
+
+// initialize
+placeFood();
+trail.push({x: head.x, y: head.y});
+
+function update(dt){
+  if(!running) return;
+  // move head
+  const moveDist = speed * dt;
+  head.x += dir.x * moveDist;
+  head.y += dir.y * moveDist;
+  // keep head within frame (collision detection with walls)
+  if(head.x < frame.x || head.x > frame.x+frame.size || head.y < frame.y || head.y > frame.y+frame.size){
+    endGame();
+    return;
+  }
+  // add to trail
+  trail.push({x: head.x, y: head.y});
+  // trim trail to desiredLength (in pixels) by removing older points while preserving pixel-length
+  let total = 0;
+  for(let i=trail.length-1;i>0;i--){
+    const a = trail[i], b = trail[i-1];
+    const dx = a.x-b.x, dy=a.y-b.y;
+    total += Math.hypot(dx,dy);
+    if(total >= desiredLength) {
+      // cut array up to i-1
+      trail = trail.slice(i-1);
+      break;
+    }
+  }
+  // ensure trail isn't empty
+  if(trail.length===0) trail.push({x:head.x,y:head.y});
+
+  // self-collision: check if head intersects older segments beyond a short safe zone
+  // We'll check against points older than 10 px of the trail
+  let distScan = 10 + desiredLength*0.2; // safety zone
+  let acc=0;
+  for(let i=trail.length-1;i>0;i--){
+    const a = trail[i], b = trail[i-1];
+    const segLen = Math.hypot(a.x-b.x,a.y-b.y);
+    acc += segLen;
+    if(acc < distScan) continue; // skip recent points
+    // segment collision: distance from head to segment
+    if(pointToSegmentDistance(head.x,head.y,b.x,b.y,a.x,a.y) < 6){
+      endGame();
+      return;
+    }
+  }
+
+  // eating food
+  if(food){
+    const d2 = (head.x-food.x)*(head.x-food.x) + (head.y-food.y)*(head.y-food.y);
+    if(d2 <= (foodRadius+6)*(foodRadius+6)){
+      // eaten
+      score += 5;
+      scoreEl.textContent = `Очки: ${score}`;
+      desiredLength += 2; // increase length by 2 pixels
+      placeFood();
+    }
+  }
+}
+
+function pointToSegmentDistance(px,py,x1,y1,x2,y2){
+  const A = px-x1, B = py-y1, C = x2-x1, D = y2-y1;
+  const dot = A*C + B*D;
+  const len_sq = C*C + D*D;
+  let param = -1;
+  if(len_sq !== 0) param = dot / len_sq;
+  let xx, yy;
+  if(param < 0){xx = x1; yy = y1;} else if(param > 1){xx = x2; yy = y2;} else {xx = x1 + param*C; yy = y1 + param*D;}
+  const dx = px - xx, dy = py - yy;
+  return Math.hypot(dx,dy);
+}
+
+function draw(){
+  // clear
+  ctx.clearRect(0,0,W,H);
+  // background black already
+  // draw white frame
+  ctx.save();
+  ctx.lineWidth = 2;
+  ctx.strokeStyle = '#fff';
+  ctx.strokeRect(frame.x, frame.y, frame.size, frame.size);
+  ctx.restore();
+
+  // draw food
+  if(food){
+    ctx.beginPath();
+    ctx.fillStyle = '#fff';
+    ctx.arc(food.x, food.y, foodRadius, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // draw trail (fading)
+  if(trail.length>1){
+    ctx.beginPath();
+    for(let i=0;i<trail.length;i++){
+      const p = trail[i];
+      if(i===0) ctx.moveTo(p.x,p.y); else ctx.lineTo(p.x,p.y);
+    }
+    ctx.lineWidth = 6; // visual thickness of tail
+    ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+    ctx.stroke();
+  }
+
+  // draw arrow as a filled triangle pointing in dir with length desiredLength (but min visual size)
+  const arrowLen = Math.max(8, Math.round(desiredLength));
+  const headSize = arrowLen;
+  // compute perpendicular
+  const ang = Math.atan2(dir.y, dir.x);
+  const perpX = Math.cos(ang + Math.PI/2);
+  const perpY = Math.sin(ang + Math.PI/2);
+  // triangle points: tip at head, base two points behind
+  const tip = {x: head.x + Math.cos(ang)*headSize/1.5, y: head.y + Math.sin(ang)*headSize/1.5};
+  const baseCenter = {x: head.x - Math.cos(ang)*headSize/1.5, y: head.y - Math.sin(ang)*headSize/1.5};
+  const half = Math.max(4, headSize/2.4);
+  const p1 = {x: baseCenter.x + perpX*half, y: baseCenter.y + perpY*half};
+  const p2 = {x: baseCenter.x - perpX*half, y: baseCenter.y - perpY*half};
+  ctx.beginPath();
+  ctx.fillStyle = '#fff';
+  ctx.moveTo(tip.x, tip.y);
+  ctx.lineTo(p1.x, p1.y);
+  ctx.lineTo(p2.x, p2.y);
+  ctx.closePath();
+  ctx.fill();
+
+  // optional: draw head circle center
+  // ctx.beginPath(); ctx.fillStyle='#fff'; ctx.arc(head.x,head.y,2,0,Math.PI*2); ctx.fill();
+
+  if(gameOver){
+    ctx.save();
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0,0,W,H);
+    ctx.fillStyle = '#fff';
+    ctx.font = '28px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('Игра окончена', W/2, H/2 - 10);
+    ctx.font = '18px sans-serif';
+    ctx.fillText('Нажмите R или коснитесь для перезапуска', W/2, H/2 + 20);
+    ctx.restore();
+  }
+}
+
+function loop(ts){
+  if(!lastTime) lastTime = ts;
+  const dt = Math.min(0.05, (ts - lastTime)/1000); lastTime = ts;
+  if(!gameOver) update(dt);
+  draw();
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+
+function endGame(){
+  gameOver = true;
+  running = false;
+}
+
+function reset(){
+  score = 0; scoreEl.textContent = `Очки: ${score}`;
+  dir = {x:1,y:0};
+  desiredLength = 5;
+  head = { x: frame.x + frame.size/2, y: frame.y + frame.size/2 };
+  trail = [{x:head.x,y:head.y}];
+  placeFood();
+  gameOver = false; running = true; lastTime = null;
+}
+
+// Joystick behavior
+function getRect(el){ return el.getBoundingClientRect(); }
+function startJoystick(clientX, clientY){
+  joystickActive = true;
+  const baseRect = getRect(joyWrap);
+  joystickCenter = { x: baseRect.left + baseRect.width/2, y: baseRect.top + baseRect.height/2 };
+  joyWrap.style.pointerEvents = 'auto';
+  moveJoystick(clientX, clientY);
+}
+function moveJoystick(clientX, clientY){
+  if(!joystickActive) return;
+  let dx = clientX - joystickCenter.x;
+  let dy = clientY - joystickCenter.y;
+  const dist = Math.hypot(dx,dy);
+  const max = joyWrap.clientWidth/2 - 10;
+  const limited = Math.min(dist, max);
+  if(dist>0){ dx = dx/dist * limited; dy = dy/dist * limited; }
+  joyKnob.style.transform = `translate(calc(-50% + ${dx}px), calc(-50% + ${dy}px))`;
+  // normalized direction
+  if(dist > 8){
+    dir.x = dx / max;
+    dir.y = dy / max;
+    // normalize
+    const len = Math.hypot(dir.x, dir.y);
+    if(len>0){ dir.x /= len; dir.y /= len; }
+  }
+}
+function endJoystick(){
+  joystickActive = false;
+  joyKnob.style.transform = `translate(-50%,-50%)`;
+}
+
+// touch events
+joyWrap.addEventListener('touchstart', (e)=>{ e.preventDefault(); const t=e.changedTouches[0]; startJoystick(t.clientX, t.clientY); });
+joyWrap.addEventListener('touchmove', (e)=>{ e.preventDefault(); const t=e.changedTouches[0]; moveJoystick(t.clientX, t.clientY); });
+joyWrap.addEventListener('touchend', (e)=>{ e.preventDefault(); endJoystick(); });
+
+// support mouse for desktop users (pointer events)
+joyWrap.addEventListener('pointerdown', (e)=>{ if(e.pointerType==='mouse' || e.pointerType==='touch') { e.preventDefault(); startJoystick(e.clientX,e.clientY); joyWrap.setPointerCapture(e.pointerId); }});
+joyWrap.addEventListener('pointermove', (e)=>{ if(joystickActive){ e.preventDefault(); moveJoystick(e.clientX,e.clientY); }});
+joyWrap.addEventListener('pointerup', (e)=>{ endJoystick(); });
+joyWrap.addEventListener('pointercancel', (e)=>{ endJoystick(); });
+
+// Also allow touching anywhere on canvas to set direction (for convenience)
+canvas.addEventListener('pointerdown', (e)=>{ if(gameOver){ reset(); return; } const r = canvas.getBoundingClientRect(); const cx = e.clientX - r.left, cy = e.clientY - r.top; const nx = cx - head.x, ny = cy - head.y; const len = Math.hypot(nx,ny); if(len>0){ dir.x = nx/len; dir.y = ny/len; } });
+
+// Keyboard fallback
+window.addEventListener('keydown', (e)=>{
+  if(e.key === 'r' || e.key === 'R') { reset(); }
+  if(gameOver) return;
+  if(e.key === 'ArrowUp' || e.key === 'w' || e.key === 'W') { dir = {x:0,y:-1}; }
+  if(e.key === 'ArrowDown' || e.key === 's' || e.key === 'S') { dir = {x:0,y:1}; }
+  if(e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') { dir = {x:-1,y:0}; }
+  if(e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') { dir = {x:1,y:0}; }
+});
+
+// Make joystick visible and semi-transparent like in Minecraft Bedrock style
+(function styleJoystick(){
+  // increase base opacity a bit for visibility on small screens
+  const base = document.querySelector('.joy-base');
+  base.style.background = 'rgba(255,255,255,0.04)';
+  base.style.boxShadow = 'inset 0 0 0 2px rgba(255,255,255,0.06)';
+  const knob = document.querySelector('.joy-knob');
+  knob.style.background = 'rgba(255,255,255,0.12)';
+})();
+
+// Responsive: ensure frame remains centered if canvas resizes
+function resizeCanvas(w=640){
+  // do nothing for now - fixed size canvas
+}
+
+</script></body>
+</html>
